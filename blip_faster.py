@@ -12,52 +12,35 @@ from threading import Lock
 
 
 class BLIPImageCaptioning:
-    """BLIP Image Captioning Model Implementation - Optimized for Speed"""
-    
     def __init__(self, model_name="Salesforce/blip-image-captioning-large"):
-        """
-        Initialize the BLIP model and processor with optimizations.
-        
-        Args:
-            model_name: Hugging Face model identifier
-        """
         print(f"Loading BLIP model: {model_name}")
-        
-        # CPU optimization: Set thread counts before loading model
-        if not torch.cuda.is_available():
-            num_threads = os.cpu_count() or 4
-            torch.set_num_threads(num_threads)
-            torch.set_num_interop_threads(num_threads)
-            print(f"CPU optimization: Using {num_threads} threads")
-        
+
         try:
-            # Try fast processor first
             self.processor = BlipProcessor.from_pretrained(model_name, use_fast=True)
-            print("Using fast image processor")
         except Exception:
-            # Fallback to slow processor
             self.processor = BlipProcessor.from_pretrained(model_name)
-            print("Using slow image processor")
-        
+
         self.model = BlipForConditionalGeneration.from_pretrained(model_name)
         self.model.eval()
-        
-        # Move to device (GPU if available)
+
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.model.to(self.device)
-        print(f"Model loaded on: {self.device}")
-        
-        # Try to compile model for faster inference (PyTorch 2.0+)
-        try:
-            if hasattr(torch, 'compile') and not torch.cuda.is_available():
-                print("Compiling model for faster CPU inference...")
-                self.model = torch.compile(self.model, mode='reduce-overhead')
-                print("Model compiled successfully")
-        except Exception as compile_error:
-            print(f"Model compilation skipped: {compile_error}")
-        
-        print("Model loaded successfully!")
-    
+
+        # 🔥 Enable FP16 on GPU
+        if self.device.startswith("cuda"):
+            self.model.half()
+            print("Running model in FP16 mode for speed")
+
+        # Warmup (important for transformer models)
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=self.device.startswith("cuda")):
+            dummy = self.processor(
+                images=Image.new("RGB", (384, 384), color="white"),
+                return_tensors="pt"
+            ).to(self.device)
+            _ = self.model.generate(**dummy, max_length=5)
+
+        print(f"Model loaded on {self.device} (optimized)")
+
     def load_image_from_url(self, url):
         """
         Load an image from a URL.
@@ -92,92 +75,73 @@ class BLIPImageCaptioning:
         except Exception as e:
             raise Exception(f"Error loading image from path: {e}")
     
-    def generate_caption_conditional(self, image, prompt_text="a photography of", max_length=30, num_beams=1):
-        """
-        Generate a caption for an image with a conditional prompt (optimized).
-        
-        Args:
-            image: PIL Image object
-            prompt_text: Text prompt to condition the caption generation
-            max_length: Maximum caption length (default: 30 for speed)
-            num_beams: Number of beams for beam search (1 = greedy, faster)
-            
-        Returns:
-            Generated caption string
-        """
-        inputs = self.processor(image, prompt_text, return_tensors="pt").to(self.device)
-        
-        # Use inference_mode for faster inference
-        with torch.inference_mode():
-            out = self.model.generate(
-                **inputs,
-                max_length=max_length,
-                num_beams=num_beams,
-                do_sample=False  # Deterministic for speed
-            )
-        caption = self.processor.decode(out[0], skip_special_tokens=True)
-        return caption
-    
     def generate_caption_unconditional(self, image, max_length=30, num_beams=1):
-        """
-        Generate a caption for an image without any prompt (optimized).
-        
-        Args:
-            image: PIL Image object
-            max_length: Maximum caption length (default: 30 for speed)
-            num_beams: Number of beams for beam search (1 = greedy, faster)
-            
-        Returns:
-            Generated caption string
-        """
         inputs = self.processor(image, return_tensors="pt").to(self.device)
-        
-        # Use inference_mode for faster inference
+
         with torch.inference_mode():
-            out = self.model.generate(
-                **inputs,
-                max_length=max_length,
-                num_beams=num_beams,
-                do_sample=False  # Deterministic for speed
-            )
-        caption = self.processor.decode(out[0], skip_special_tokens=True)
-        return caption
-    
-    def generate_captions_batch(self, images: List[Image.Image], use_conditional: bool = False, 
-                                prompt: str = "a photography of", max_length=30, num_beams=1) -> List[str]:
-        """
-        Generate captions for multiple images in a batch (much faster).
-        
-        Args:
-            images: List of PIL Image objects
-            use_conditional: Whether to use conditional captioning
-            prompt: Prompt text for conditional captioning
-            max_length: Maximum caption length
-            num_beams: Number of beams for beam search
-            
-        Returns:
-            List of caption strings
-        """
+            with torch.cuda.amp.autocast(enabled=self.device.startswith("cuda")):
+                out = self.model.generate(
+                    **inputs,
+                    max_length=max_length,
+                    num_beams=num_beams,
+                    do_sample=False
+                )
+        return self.processor.decode(out[0], skip_special_tokens=True)
+
+    def generate_caption_conditional(self, image, prompt_text="a photography of", max_length=30, num_beams=1):
+        inputs = self.processor(image, prompt_text, return_tensors="pt").to(self.device)
+
+        with torch.inference_mode():
+            with torch.cuda.amp.autocast(enabled=self.device.startswith("cuda")):
+                out = self.model.generate(
+                    **inputs,
+                    max_length=max_length,
+                    num_beams=num_beams,
+                    do_sample=False
+                )
+        return self.processor.decode(out[0], skip_special_tokens=True)
+
+    def generate_captions_batch(
+        self,
+        images: List[Image.Image],
+        use_conditional: bool = False,
+        prompt: str = "a photography of",
+        max_length: int = 30,
+        num_beams: int = 1
+    ) -> List[str]:
+
         if not images:
             return []
-        
-        # Process images in batch
+
+        # Prepare inputs ONCE
         if use_conditional:
-            inputs = self.processor(images=images, text=[prompt] * len(images), return_tensors="pt", padding=True).to(self.device)
+            inputs = self.processor(
+                images=images,
+                text=[prompt] * len(images),
+                return_tensors="pt",
+                padding=True
+            ).to(self.device, non_blocking=True)
         else:
-            inputs = self.processor(images=images, return_tensors="pt", padding=True).to(self.device)
-        
-        # Use inference_mode for faster inference
+            inputs = self.processor(
+                images=images,
+                return_tensors="pt",
+                padding=True
+            ).to(self.device, non_blocking=True)
+
+        # 🔥 FP16 + inference_mode + autocast
         with torch.inference_mode():
-            generated_ids = self.model.generate(
-                **inputs,
-                max_length=max_length,
-                num_beams=num_beams,
-                do_sample=False
-            )
-        
+            with torch.cuda.amp.autocast(enabled=self.device.startswith("cuda"), dtype=torch.float16):
+                generated_ids = self.model.generate(
+                    **inputs,
+                    max_length=max_length,
+                    num_beams=num_beams,
+                    do_sample=False,
+                    early_stopping=True
+                )
+
+        # Decode on CPU
         captions = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
-        return [caption.strip() for caption in captions]
+        return [c.strip() for c in captions]
 
 
 def process_images_from_directory(
@@ -213,6 +177,18 @@ def process_images_from_directory(
     model_load_time = time.time() - model_start_time
     print(f"Model loading time: {model_load_time:.2f} seconds")
     print()
+
+    if torch.cuda.is_available():
+        free_mem = torch.cuda.mem_get_info()[0] / (1024**2)
+        if free_mem > 10_000:   # >10GB free
+            batch_size = min(batch_size, 32)
+        elif free_mem > 5000:
+            batch_size = min(batch_size, 16)
+        else:
+            batch_size = min(batch_size, 8)
+
+    print(f"Auto-tuned batch size to: {batch_size}")
+
     
     # Get all image files from directory
     images_path = Path(images_dir)

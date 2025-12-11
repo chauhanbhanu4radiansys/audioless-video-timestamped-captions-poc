@@ -1,0 +1,32 @@
+# Requirements for BLIP-2 and MiniCPM-V Image Captioning Models
+# Install with: pip install -r requirements_models.txt
+
+# PyTorch (choose based on your system)
+# For CUDA 12.x:
+# torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu121
+# torchvision>=0.15.0 --index-url https://download.pytorch.org/whl/cu121
+# torchaudio>=2.0.0 --index-url https://download.pytorch.org/whl/cu121
+
+# For CUDA 11.8:
+# torch>=2.0.0 --index-url https://download.pytorch.org/whl/cu118
+# torchvision>=0.15.0 --index-url https://download.pytorch.org/whl/cu118
+# torchaudio>=2.0.0 --index-url https://download.pytorch.org/whl/cu118
+
+# For CPU-only:
+# torch>=2.0.0 --index-url https://download.pytorch.org/whl/cpu
+# torchvision>=0.15.0 --index-url https://download.pytorch.org/whl/cpu
+# torchaudio>=2.0.0 --index-url https://download.pytorch.org/whl/cpu
+
+# Core dependencies (install these first)
+transformers>=4.35.2
+huggingface_hub>=0.19.4
+pillow>=9.0.0
+requests>=2.31.0
+
+# Additional dependencies for MiniCPM-V
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+
+# Optional but recommended
+accelerate>=0.24.0
+psutil>=5.9.0  # For memory checking

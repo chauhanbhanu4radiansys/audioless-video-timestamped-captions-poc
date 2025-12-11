@@ -1,6 +1,6 @@
 import requests
 from PIL import Image
-from transformers import BlipProcessor, BlipForConditionalGeneration
+from transformers import BlipProcessor, Blip2ForConditionalGeneration
 import argparse
 from pathlib import Path
 import time
@@ -11,17 +11,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
 
-class BLIPImageCaptioning:
-    """BLIP Image Captioning Model Implementation - Optimized for Speed"""
+class BLIP2ImageCaptioning:
+    """BLIP-2 Image Captioning Model Implementation (Flan-T5-XL) - Optimized for Speed"""
     
-    def __init__(self, model_name="Salesforce/blip-image-captioning-large"):
+    def __init__(self, model_name="Salesforce/blip2-flan-t5-xl"):
         """
-        Initialize the BLIP model and processor with optimizations.
+        Initialize the BLIP-2 model and processor with optimizations.
         
         Args:
-            model_name: Hugging Face model identifier
+            model_name: Hugging Face model identifier (default: blip2-flan-t5-base)
         """
-        print(f"Loading BLIP model: {model_name}")
+        print(f"Loading BLIP-2 model: {model_name}")
         
         # CPU optimization: Set thread counts before loading model
         if not torch.cuda.is_available():
@@ -31,15 +31,23 @@ class BLIPImageCaptioning:
             print(f"CPU optimization: Using {num_threads} threads")
         
         try:
-            # Try fast processor first
-            self.processor = BlipProcessor.from_pretrained(model_name, use_fast=True)
-            print("Using fast image processor")
-        except Exception:
-            # Fallback to slow processor
-            self.processor = BlipProcessor.from_pretrained(model_name)
-            print("Using slow image processor")
+            # Try fast processor first (requires torchvision)
+            try:
+                self.processor = BlipProcessor.from_pretrained(model_name, use_fast=True)
+                print("Using fast image processor")
+            except (ImportError, Exception) as e:
+                # Fallback to slow processor if torchvision not available or fast processor fails
+                print(f"Fast processor not available ({str(e)[:50]}...), using slow processor")
+                self.processor = BlipProcessor.from_pretrained(model_name, use_fast=False)
+                print("Using slow image processor")
+        except Exception as e:
+            raise Exception(f"Failed to load processor: {e}. Make sure torchvision is installed: pip install torchvision")
         
-        self.model = BlipForConditionalGeneration.from_pretrained(model_name)
+        # Load BLIP-2 model
+        self.model = Blip2ForConditionalGeneration.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+        )
         self.model.eval()
         
         # Move to device (GPU if available)
@@ -49,9 +57,13 @@ class BLIPImageCaptioning:
         
         # Try to compile model for faster inference (PyTorch 2.0+)
         try:
-            if hasattr(torch, 'compile') and not torch.cuda.is_available():
-                print("Compiling model for faster CPU inference...")
-                self.model = torch.compile(self.model, mode='reduce-overhead')
+            if hasattr(torch, 'compile'):
+                if torch.cuda.is_available():
+                    print("Compiling model for faster GPU inference...")
+                    self.model = torch.compile(self.model, mode='max-autotune')
+                else:
+                    print("Compiling model for faster CPU inference...")
+                    self.model = torch.compile(self.model, mode='reduce-overhead')
                 print("Model compiled successfully")
         except Exception as compile_error:
             print(f"Model compilation skipped: {compile_error}")
@@ -182,7 +194,7 @@ class BLIPImageCaptioning:
 
 def process_images_from_directory(
     images_dir: str,
-    model_name: str = "Salesforce/blip-image-captioning-large",
+    model_name: str = "Salesforce/blip2-flan-t5-xl",
     use_conditional: bool = False,
     prompt: str = "a photography of",
     batch_size: int = 8,
@@ -194,22 +206,22 @@ def process_images_from_directory(
     
     Args:
         images_dir: Directory containing images
-        model_name: BLIP model name
+        model_name: BLIP-2 model name
         use_conditional: Whether to use conditional captioning
         prompt: Prompt text for conditional captioning
         batch_size: Number of images to process at once (default: 8)
         max_length: Maximum caption length (default: 30 for speed)
-        num_workers: Number of worker threads for parallel image loading (default: min(8, batch_size))
+        num_workers: Number of worker threads for parallel image loading (default: 6)
     
     Returns:
         List of dictionaries with image path, caption, and timing info
     """
     # Initialize model
     print("=" * 60)
-    print("INITIALIZING BLIP MODEL")
+    print("INITIALIZING BLIP-2 MODEL (Flan-T5-XL)")
     print("=" * 60)
     model_start_time = time.time()
-    blip_model = BLIPImageCaptioning(model_name=model_name)
+    blip_model = BLIP2ImageCaptioning(model_name=model_name)
     model_load_time = time.time() - model_start_time
     print(f"Model loading time: {model_load_time:.2f} seconds")
     print()
@@ -249,14 +261,10 @@ def process_images_from_directory(
     individual_times = []
     
     # Auto-adjust batch size based on device (but respect user's choice)
-    original_batch_size = batch_size
     if blip_model.device == "cpu":
-        # CPU can handle larger batches too, but be conservative
-        # User can override with --batch-size if they want more
         if batch_size > 16:
             print(f"⚠️  Warning: Large batch size ({batch_size}) on CPU may be slow. Consider using GPU or reducing batch size.")
     elif torch.cuda.is_available():
-        # Larger batches for GPU are more efficient
         if batch_size > 32:
             print(f"⚠️  Warning: Very large batch size ({batch_size}) may cause GPU memory issues.")
     
@@ -406,41 +414,38 @@ def process_images_from_directory(
 
 
 def main():
-    """Main function - Processes all images in a directory"""
+    """Main function - Processes a single image or all images in a directory"""
     parser = argparse.ArgumentParser(
-        description="BLIP Image Captioning - Captions all images in a directory (Optimized)",
+        description="BLIP-2 Image Captioning (Flan-T5-XL) - Captions a single image or all images in a directory",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Process all images in 'images' directory (default)
-  python blip_image_captioning.py
+  # Process a single image file
+  python blip2_image_captioning.py image.jpg
   
-  # Process images in a specific directory
-  python blip_image_captioning.py /path/to/images
+  # Process all images in a directory
+  python blip2_image_captioning.py /path/to/images
   
-  # Use conditional captioning
-  python blip_image_captioning.py --conditional --prompt "a photography of"
+  # Single image with conditional captioning
+  python blip2_image_captioning.py image.jpg --conditional --prompt "a photography of"
   
-  # Adjust batch size for faster processing
-  python blip_image_captioning.py --batch-size 16
+  # Directory with custom batch size
+  python blip2_image_captioning.py images/ --batch-size 16
   
   # Save results to JSON
-  python blip_image_captioning.py --output captions.json
+  python blip2_image_captioning.py images/ --output captions.json
         """
     )
     parser.add_argument(
-        "images_dir",
+        "input_path",
         type=str,
-        nargs='?',
-        default="images",
-        help="Directory containing images to process (default: 'images')"
+        help="Path to a single image file or directory containing images to process"
     )
     parser.add_argument(
         "--model",
         type=str,
-        default="Salesforce/blip-image-captioning-large",
-        choices=["Salesforce/blip-image-captioning-base", "Salesforce/blip-image-captioning-large"],
-        help="BLIP model to use (default: large)"
+        default="Salesforce/blip2-flan-t5-xl",
+        help="BLIP-2 model to use. Options: Salesforce/blip2-flan-t5-xl, Salesforce/blip2-opt-2.7b, Salesforce/blip2-opt-6.7b (default: blip2-flan-t5-xl)"
     )
     parser.add_argument(
         "--conditional",
@@ -475,104 +480,95 @@ Examples:
         "--output",
         type=str,
         default=None,
-        help="Output JSON file to save results (optional)"
-    )
-    
-    # Legacy arguments for single image processing
-    parser.add_argument(
-        "--image-url",
-        type=str,
-        default=None,
-        help="URL of a single image to caption (legacy mode)"
-    )
-    parser.add_argument(
-        "--image-path",
-        type=str,
-        default=None,
-        help="Local path to a single image file (legacy mode)"
-    )
-    parser.add_argument(
-        "--unconditional",
-        action="store_true",
-        help="Use unconditional captioning (legacy mode)"
+        help="Output JSON file to save results (optional, only used for directory processing)"
     )
     
     args = parser.parse_args()
     
-    # Legacy single image mode (only if explicitly requested)
-    if args.image_url or args.image_path:
-        print("=" * 60)
-        print("LEGACY MODE: Single Image Processing")
-        print("=" * 60)
-        
-        blip_model = BLIPImageCaptioning(model_name=args.model)
-        
-        if args.image_path:
-            if not Path(args.image_path).exists():
-                print(f"Error: Image file not found: {args.image_path}")
-                exit(1)
-            image = blip_model.load_image_from_path(args.image_path)
-            print(f"Loaded image from: {args.image_path}")
-        else:
-            image = blip_model.load_image_from_path(args.image_url)
-            print(f"Loaded image from URL: {args.image_url}")
-        
-        if args.conditional:
-            start_time = time.time()
-            caption = blip_model.generate_caption_conditional(image, args.prompt, max_length=args.max_length)
-            elapsed = time.time() - start_time
-            print(f"\nConditional Caption (prompt: '{args.prompt}'): {caption}")
-            print(f"Processing time: {elapsed:.3f} seconds")
-        
-        if args.unconditional:
-            start_time = time.time()
-            caption = blip_model.generate_caption_unconditional(image, max_length=args.max_length)
-            elapsed = time.time() - start_time
-            print(f"\nUnconditional Caption: {caption}")
-            print(f"Processing time: {elapsed:.3f} seconds")
-        
-        if not args.conditional and not args.unconditional:
-            print("\n--- Conditional Image Captioning ---")
-            start_time = time.time()
-            conditional_caption = blip_model.generate_caption_conditional(image, args.prompt, max_length=args.max_length)
-            elapsed = time.time() - start_time
-            print(f"Prompt: '{args.prompt}'")
-            print(f"Caption: {conditional_caption}")
-            print(f"Time: {elapsed:.3f} seconds")
-            
-            print("\n--- Unconditional Image Captioning ---")
-            start_time = time.time()
-            unconditional_caption = blip_model.generate_caption_unconditional(image, max_length=args.max_length)
-            elapsed = time.time() - start_time
-            print(f"Caption: {unconditional_caption}")
-            print(f"Time: {elapsed:.3f} seconds")
-        
-        return  # Exit early, don't process directory
+    # Resolve input path
+    input_path = Path(args.input_path).expanduser().resolve()
     
-    # Default mode: Process all images in directory
-    try:
-        results = process_images_from_directory(
-            images_dir=args.images_dir,
-            model_name=args.model,
-            use_conditional=args.conditional,
-            prompt=args.prompt,
-            batch_size=args.batch_size,
-            max_length=args.max_length,
-            num_workers=args.num_workers
-        )
-            
-        # Save results to JSON if requested
-        if args.output:
-            import json
-            output_path = Path(args.output)
-            with open(output_path, 'w') as f:
-                json.dump(results, f, indent=2)
-            print(f"\n✅ Results saved to: {output_path}")
+    if not input_path.exists():
+        print(f"❌ Error: Path does not exist: {args.input_path}")
+        exit(1)
+    
+    # Initialize model
+    blip_model = BLIP2ImageCaptioning(model_name=args.model)
+    
+    # Check if input is a file or directory
+    if input_path.is_file():
+        # Single image file processing
+        print("=" * 60)
+        print("SINGLE IMAGE PROCESSING")
+        print("=" * 60)
+        print(f"Processing image: {input_path.name}")
+        print()
         
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
+        try:
+            image = blip_model.load_image_from_path(str(input_path))
+            
+            if args.conditional:
+                start_time = time.time()
+                caption = blip_model.generate_caption_conditional(image, args.prompt, max_length=args.max_length)
+                elapsed = time.time() - start_time
+                print(f"Conditional Caption (prompt: '{args.prompt}'): {caption}")
+                print(f"Processing time: {elapsed:.3f} seconds")
+            else:
+                start_time = time.time()
+                caption = blip_model.generate_caption_unconditional(image, max_length=args.max_length)
+                elapsed = time.time() - start_time
+                print(f"Caption: {caption}")
+                print(f"Processing time: {elapsed:.3f} seconds")
+            
+            # Save to JSON if requested
+            if args.output:
+                import json
+                output_path = Path(args.output)
+                result = {
+                    'image_path': str(input_path),
+                    'image_name': input_path.name,
+                    'caption': caption,
+                    'processing_time': elapsed
+                }
+                with open(output_path, 'w') as f:
+                    json.dump([result], f, indent=2)
+                print(f"\n✅ Result saved to: {output_path}")
+        
+        except Exception as e:
+            print(f"\n❌ Error processing image: {e}")
+            import traceback
+            traceback.print_exc()
+            exit(1)
+    
+    elif input_path.is_dir():
+        # Directory processing
+        try:
+            results = process_images_from_directory(
+                images_dir=str(input_path),
+                model_name=args.model,
+                use_conditional=args.conditional,
+                prompt=args.prompt,
+                batch_size=args.batch_size,
+                max_length=args.max_length,
+                num_workers=args.num_workers
+            )
+                
+            # Save results to JSON if requested
+            if args.output:
+                import json
+                output_path = Path(args.output)
+                with open(output_path, 'w') as f:
+                    json.dump(results, f, indent=2)
+                print(f"\n✅ Results saved to: {output_path}")
+        
+        except Exception as e:
+            print(f"\n❌ Error: {e}")
+            import traceback
+            traceback.print_exc()
+            exit(1)
+    
+    else:
+        print(f"❌ Error: Path is neither a file nor a directory: {args.input_path}")
         exit(1)
 
 

@@ -1,58 +1,130 @@
 import requests
 from PIL import Image
-from transformers import BlipProcessor, BlipForConditionalGeneration
+from transformers import AutoModel, AutoTokenizer
 import argparse
 from pathlib import Path
 import time
 import os
+import sys
 from typing import List, Dict
 import torch
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
-class BLIPImageCaptioning:
-    """BLIP Image Captioning Model Implementation - Optimized for Speed"""
+
+class MiniCPMVImageCaptioning:
+    """MiniCPM-V 2.6 (2.4B) Image Captioning Model Implementation - Optimized for Speed"""
     
-    def __init__(self, model_name="Salesforce/blip-image-captioning-large"):
+    def __init__(self, model_name="openbmb/MiniCPM-V-2_6"):
         """
-        Initialize the BLIP model and processor with optimizations.
+        Initialize the MiniCPM-V model and tokenizer with optimizations.
         
         Args:
-            model_name: Hugging Face model identifier
+            model_name: Hugging Face model identifier (default: MiniCPM-V-2_6)
         """
-        print(f"Loading BLIP model: {model_name}")
+        print(f"Loading MiniCPM-V model: {model_name}")
         
-        # CPU optimization: Set thread counts before loading model
+        # Check available memory before loading (CPU only)
         if not torch.cuda.is_available():
+            if HAS_PSUTIL:
+                try:
+                    available_memory_gb = psutil.virtual_memory().available / (1024**3)
+                    total_memory_gb = psutil.virtual_memory().total / (1024**3)
+                    print(f"System Memory: {available_memory_gb:.1f} GB available / {total_memory_gb:.1f} GB total")
+                    
+                    # MiniCPM-V 2.6 needs ~16GB+ RAM for CPU inference
+                    if available_memory_gb < 12:
+                        print(f"⚠️  WARNING: Low available memory ({available_memory_gb:.1f} GB)")
+                        print("   MiniCPM-V 2.6 requires ~16GB+ RAM for CPU inference.")
+                        print("   Consider:")
+                        print("   1. Closing other applications to free memory")
+                        print("   2. Using BLIP-2 instead (requires ~8GB RAM)")
+                        print("   3. Using a machine with more RAM")
+                        print("   4. Using GPU if available")
+                        
+                        response = input("\nContinue anyway? (y/N): ")
+                        if response.lower() != 'y':
+                            print("Exiting...")
+                            sys.exit(1)
+                except Exception as e:
+                    print(f"Could not check memory: {e}")
+            else:
+                print("⚠️  Note: Install 'psutil' to check available memory before loading")
+                print("   MiniCPM-V 2.6 requires ~16GB+ RAM for CPU inference")
+            
             num_threads = os.cpu_count() or 4
             torch.set_num_threads(num_threads)
             torch.set_num_interop_threads(num_threads)
             print(f"CPU optimization: Using {num_threads} threads")
         
-        try:
-            # Try fast processor first
-            self.processor = BlipProcessor.from_pretrained(model_name, use_fast=True)
-            print("Using fast image processor")
-        except Exception:
-            # Fallback to slow processor
-            self.processor = BlipProcessor.from_pretrained(model_name)
-            print("Using slow image processor")
+        # Load tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        print("Tokenizer loaded")
         
-        self.model = BlipForConditionalGeneration.from_pretrained(model_name)
-        self.model.eval()
+        # Load model with optimizations
+        if torch.cuda.is_available():
+            # Use bfloat16 for GPU (faster and more memory efficient)
+            self.model = AutoModel.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                attn_implementation='sdpa',
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True
+            )
+            self.model = self.model.eval().cuda()
+        else:
+            # CPU: Use memory-efficient loading with float16 if possible, fallback to float32
+            # Try to use float16 first (half memory usage)
+            try:
+                print("Attempting to load model with float16 for reduced memory usage...")
+                self.model = AutoModel.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                    torch_dtype=torch.float16,
+                    low_cpu_mem_usage=True,
+                    device_map="cpu"
+                )
+                print("✓ Loaded with float16 (50% memory reduction)")
+            except Exception as e:
+                print(f"Float16 loading failed ({str(e)[:50]}...), trying float32 with memory optimizations...")
+                # Fallback to float32 with memory optimizations
+                self.model = AutoModel.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                    torch_dtype=torch.float32,
+                    low_cpu_mem_usage=True,
+                    device_map="cpu"
+                )
+                print("✓ Loaded with float32")
+            
+            self.model = self.model.eval()
         
-        # Move to device (GPU if available)
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        self.model.to(self.device)
         print(f"Model loaded on: {self.device}")
         
+        # Memory optimization: Clear cache after loading
+        if not torch.cuda.is_available():
+            import gc
+            gc.collect()
+            print("Memory cache cleared")
+        
         # Try to compile model for faster inference (PyTorch 2.0+)
+        # Skip compilation on CPU for MiniCPM-V as it can use more memory
         try:
-            if hasattr(torch, 'compile') and not torch.cuda.is_available():
-                print("Compiling model for faster CPU inference...")
-                self.model = torch.compile(self.model, mode='reduce-overhead')
+            if hasattr(torch, 'compile') and torch.cuda.is_available():
+                print("Compiling model for faster GPU inference...")
+                self.model = torch.compile(self.model, mode='max-autotune')
                 print("Model compiled successfully")
+            elif hasattr(torch, 'compile') and not torch.cuda.is_available():
+                # Only compile on CPU if we have enough memory
+                # Compilation can use extra memory, so skip it for large models on CPU
+                print("Skipping CPU compilation to save memory (MiniCPM-V is memory-intensive)")
         except Exception as compile_error:
             print(f"Model compilation skipped: {compile_error}")
         
@@ -92,68 +164,53 @@ class BLIPImageCaptioning:
         except Exception as e:
             raise Exception(f"Error loading image from path: {e}")
     
-    def generate_caption_conditional(self, image, prompt_text="a photography of", max_length=30, num_beams=1):
+    def generate_caption_conditional(self, image, prompt_text="Describe this image in detail:", max_length=100):
         """
-        Generate a caption for an image with a conditional prompt (optimized).
+        Generate a caption for an image with a conditional prompt.
         
         Args:
             image: PIL Image object
-            prompt_text: Text prompt to condition the caption generation
-            max_length: Maximum caption length (default: 30 for speed)
-            num_beams: Number of beams for beam search (1 = greedy, faster)
+            prompt_text: Text prompt/question about the image
+            max_length: Maximum caption length
             
         Returns:
             Generated caption string
         """
-        inputs = self.processor(image, prompt_text, return_tensors="pt").to(self.device)
+        msgs = [{'role': 'user', 'content': [image, prompt_text]}]
         
-        # Use inference_mode for faster inference
         with torch.inference_mode():
-            out = self.model.generate(
-                **inputs,
-                max_length=max_length,
-                num_beams=num_beams,
-                do_sample=False  # Deterministic for speed
-            )
-        caption = self.processor.decode(out[0], skip_special_tokens=True)
-        return caption
+            response = self.model.chat(image=None, msgs=msgs, tokenizer=self.tokenizer)
+        
+        return response
     
-    def generate_caption_unconditional(self, image, max_length=30, num_beams=1):
+    def generate_caption_unconditional(self, image, max_length=100):
         """
-        Generate a caption for an image without any prompt (optimized).
+        Generate a caption for an image without any prompt.
         
         Args:
             image: PIL Image object
-            max_length: Maximum caption length (default: 30 for speed)
-            num_beams: Number of beams for beam search (1 = greedy, faster)
+            max_length: Maximum caption length
             
         Returns:
             Generated caption string
         """
-        inputs = self.processor(image, return_tensors="pt").to(self.device)
-        
-        # Use inference_mode for faster inference
-        with torch.inference_mode():
-            out = self.model.generate(
-                **inputs,
-                max_length=max_length,
-                num_beams=num_beams,
-                do_sample=False  # Deterministic for speed
-            )
-        caption = self.processor.decode(out[0], skip_special_tokens=True)
-        return caption
+        # Use a generic prompt for unconditional captioning
+        prompt = "Describe this image in detail:"
+        return self.generate_caption_conditional(image, prompt_text=prompt, max_length=max_length)
     
     def generate_captions_batch(self, images: List[Image.Image], use_conditional: bool = False, 
-                                prompt: str = "a photography of", max_length=30, num_beams=1) -> List[str]:
+                                prompt: str = "Describe this image in detail:", max_length=100) -> List[str]:
         """
-        Generate captions for multiple images in a batch (much faster).
+        Generate captions for multiple images in a batch.
+        
+        Note: MiniCPM-V uses a chat interface, so we process images sequentially
+        but optimize with inference_mode.
         
         Args:
             images: List of PIL Image objects
             use_conditional: Whether to use conditional captioning
             prompt: Prompt text for conditional captioning
             max_length: Maximum caption length
-            num_beams: Number of beams for beam search
             
         Returns:
             List of caption strings
@@ -161,55 +218,47 @@ class BLIPImageCaptioning:
         if not images:
             return []
         
-        # Process images in batch
-        if use_conditional:
-            inputs = self.processor(images=images, text=[prompt] * len(images), return_tensors="pt", padding=True).to(self.device)
-        else:
-            inputs = self.processor(images=images, return_tensors="pt", padding=True).to(self.device)
+        captions = []
+        for image in images:
+            if use_conditional:
+                caption = self.generate_caption_conditional(image, prompt_text=prompt, max_length=max_length)
+            else:
+                caption = self.generate_caption_unconditional(image, max_length=max_length)
+            captions.append(caption)
         
-        # Use inference_mode for faster inference
-        with torch.inference_mode():
-            generated_ids = self.model.generate(
-                **inputs,
-                max_length=max_length,
-                num_beams=num_beams,
-                do_sample=False
-            )
-        
-        captions = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
-        return [caption.strip() for caption in captions]
+        return captions
 
 
 def process_images_from_directory(
     images_dir: str,
-    model_name: str = "Salesforce/blip-image-captioning-large",
+    model_name: str = "openbmb/MiniCPM-V-2_6",
     use_conditional: bool = False,
-    prompt: str = "a photography of",
-    batch_size: int = 8,
-    max_length: int = 30,
+    prompt: str = "Describe this image in detail:",
+    batch_size: int = 4,
+    max_length: int = 100,
     num_workers: int = None
 ) -> List[Dict]:
     """
-    Process all images from a directory and generate captions (optimized with batching and parallel loading).
+    Process all images from a directory and generate captions (optimized with parallel loading).
     
     Args:
         images_dir: Directory containing images
-        model_name: BLIP model name
+        model_name: MiniCPM-V model name
         use_conditional: Whether to use conditional captioning
         prompt: Prompt text for conditional captioning
-        batch_size: Number of images to process at once (default: 8)
-        max_length: Maximum caption length (default: 30 for speed)
-        num_workers: Number of worker threads for parallel image loading (default: min(8, batch_size))
+        batch_size: Number of images to process at once (default: 4, MiniCPM-V is memory intensive)
+        max_length: Maximum caption length (default: 100)
+        num_workers: Number of worker threads for parallel image loading (default: 6)
     
     Returns:
         List of dictionaries with image path, caption, and timing info
     """
     # Initialize model
     print("=" * 60)
-    print("INITIALIZING BLIP MODEL")
+    print("INITIALIZING MiniCPM-V MODEL")
     print("=" * 60)
     model_start_time = time.time()
-    blip_model = BLIPImageCaptioning(model_name=model_name)
+    minicpm_model = MiniCPMVImageCaptioning(model_name=model_name)
     model_load_time = time.time() - model_start_time
     print(f"Model loading time: {model_load_time:.2f} seconds")
     print()
@@ -248,17 +297,15 @@ def process_images_from_directory(
     results = []
     individual_times = []
     
-    # Auto-adjust batch size based on device (but respect user's choice)
-    original_batch_size = batch_size
-    if blip_model.device == "cpu":
-        # CPU can handle larger batches too, but be conservative
-        # User can override with --batch-size if they want more
-        if batch_size > 16:
+    # MiniCPM-V is memory intensive, so be conservative with batch sizes
+    if minicpm_model.device == "cpu":
+        if batch_size > 4:
             print(f"⚠️  Warning: Large batch size ({batch_size}) on CPU may be slow. Consider using GPU or reducing batch size.")
+            batch_size = min(batch_size, 4)
     elif torch.cuda.is_available():
-        # Larger batches for GPU are more efficient
-        if batch_size > 32:
+        if batch_size > 8:
             print(f"⚠️  Warning: Very large batch size ({batch_size}) may cause GPU memory issues.")
+            batch_size = min(batch_size, 8)
     
     print(f"Batch size: {batch_size} images per batch")
     
@@ -272,7 +319,7 @@ def process_images_from_directory(
     def load_image_safe(image_path: Path) -> tuple:
         """Load image and return (image_path, image or None, error or None)"""
         try:
-            image = blip_model.load_image_from_path(str(image_path))
+            image = minicpm_model.load_image_from_path(str(image_path))
             return (image_path, image, None)
         except Exception as e:
             return (image_path, None, str(e))
@@ -323,12 +370,11 @@ def process_images_from_directory(
             valid_indices = [i for i, img in enumerate(batch_images) if img is not None]
             
             if valid_images:
-                batch_captions = blip_model.generate_captions_batch(
+                batch_captions = minicpm_model.generate_captions_batch(
                     valid_images,
                     use_conditional=use_conditional,
                     prompt=prompt,
-                    max_length=max_length,
-                    num_beams=1  # Greedy decoding for speed
+                    max_length=max_length
                 )
             else:
                 batch_captions = []
@@ -369,6 +415,8 @@ def process_images_from_directory(
             
         except Exception as e:
             print(f"❌ Error processing batch {batch_num}: {e}")
+            import traceback
+            traceback.print_exc()
             # Add error results for this batch
             for image_file in batch_files:
                 result = {
@@ -406,41 +454,38 @@ def process_images_from_directory(
 
 
 def main():
-    """Main function - Processes all images in a directory"""
+    """Main function - Processes a single image or all images in a directory"""
     parser = argparse.ArgumentParser(
-        description="BLIP Image Captioning - Captions all images in a directory (Optimized)",
+        description="MiniCPM-V 2.6 Image Captioning - Captions a single image or all images in a directory",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Process all images in 'images' directory (default)
-  python blip_image_captioning.py
+  # Process a single image file
+  python minicpmv_image_captioning.py image.jpg
   
-  # Process images in a specific directory
-  python blip_image_captioning.py /path/to/images
+  # Process all images in a directory
+  python minicpmv_image_captioning.py /path/to/images
   
-  # Use conditional captioning
-  python blip_image_captioning.py --conditional --prompt "a photography of"
+  # Single image with conditional captioning
+  python minicpmv_image_captioning.py image.jpg --conditional --prompt "What objects are visible in this image?"
   
-  # Adjust batch size for faster processing
-  python blip_image_captioning.py --batch-size 16
+  # Directory with custom batch size
+  python minicpmv_image_captioning.py images/ --batch-size 4
   
   # Save results to JSON
-  python blip_image_captioning.py --output captions.json
+  python minicpmv_image_captioning.py images/ --output captions.json
         """
     )
     parser.add_argument(
-        "images_dir",
+        "input_path",
         type=str,
-        nargs='?',
-        default="images",
-        help="Directory containing images to process (default: 'images')"
+        help="Path to a single image file or directory containing images to process"
     )
     parser.add_argument(
         "--model",
         type=str,
-        default="Salesforce/blip-image-captioning-large",
-        choices=["Salesforce/blip-image-captioning-base", "Salesforce/blip-image-captioning-large"],
-        help="BLIP model to use (default: large)"
+        default="openbmb/MiniCPM-V-2_6",
+        help="MiniCPM-V model to use (default: MiniCPM-V-2_6)"
     )
     parser.add_argument(
         "--conditional",
@@ -450,20 +495,20 @@ Examples:
     parser.add_argument(
         "--prompt",
         type=str,
-        default="a photography of",
-        help="Prompt text for conditional captioning (default: 'a photography of')"
+        default="Describe this image in detail:",
+        help="Prompt text/question for conditional captioning (default: 'Describe this image in detail:')"
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=8,
-        help="Number of images to process in each batch (default: 8). Larger batches = faster processing but more memory. Try 16-32 for GPU, 8-16 for CPU."
+        default=4,
+        help="Number of images to process in each batch (default: 4). MiniCPM-V is memory intensive. Try 4-8 for GPU, 2-4 for CPU."
     )
     parser.add_argument(
         "--max-length",
         type=int,
-        default=30,
-        help="Maximum caption length (default: 30, shorter = faster)"
+        default=100,
+        help="Maximum caption length (default: 100)"
     )
     parser.add_argument(
         "--num-workers",
@@ -475,104 +520,95 @@ Examples:
         "--output",
         type=str,
         default=None,
-        help="Output JSON file to save results (optional)"
-    )
-    
-    # Legacy arguments for single image processing
-    parser.add_argument(
-        "--image-url",
-        type=str,
-        default=None,
-        help="URL of a single image to caption (legacy mode)"
-    )
-    parser.add_argument(
-        "--image-path",
-        type=str,
-        default=None,
-        help="Local path to a single image file (legacy mode)"
-    )
-    parser.add_argument(
-        "--unconditional",
-        action="store_true",
-        help="Use unconditional captioning (legacy mode)"
+        help="Output JSON file to save results (optional, only used for directory processing)"
     )
     
     args = parser.parse_args()
     
-    # Legacy single image mode (only if explicitly requested)
-    if args.image_url or args.image_path:
-        print("=" * 60)
-        print("LEGACY MODE: Single Image Processing")
-        print("=" * 60)
-        
-        blip_model = BLIPImageCaptioning(model_name=args.model)
-        
-        if args.image_path:
-            if not Path(args.image_path).exists():
-                print(f"Error: Image file not found: {args.image_path}")
-                exit(1)
-            image = blip_model.load_image_from_path(args.image_path)
-            print(f"Loaded image from: {args.image_path}")
-        else:
-            image = blip_model.load_image_from_path(args.image_url)
-            print(f"Loaded image from URL: {args.image_url}")
-        
-        if args.conditional:
-            start_time = time.time()
-            caption = blip_model.generate_caption_conditional(image, args.prompt, max_length=args.max_length)
-            elapsed = time.time() - start_time
-            print(f"\nConditional Caption (prompt: '{args.prompt}'): {caption}")
-            print(f"Processing time: {elapsed:.3f} seconds")
-        
-        if args.unconditional:
-            start_time = time.time()
-            caption = blip_model.generate_caption_unconditional(image, max_length=args.max_length)
-            elapsed = time.time() - start_time
-            print(f"\nUnconditional Caption: {caption}")
-            print(f"Processing time: {elapsed:.3f} seconds")
-        
-        if not args.conditional and not args.unconditional:
-            print("\n--- Conditional Image Captioning ---")
-            start_time = time.time()
-            conditional_caption = blip_model.generate_caption_conditional(image, args.prompt, max_length=args.max_length)
-            elapsed = time.time() - start_time
-            print(f"Prompt: '{args.prompt}'")
-            print(f"Caption: {conditional_caption}")
-            print(f"Time: {elapsed:.3f} seconds")
-            
-            print("\n--- Unconditional Image Captioning ---")
-            start_time = time.time()
-            unconditional_caption = blip_model.generate_caption_unconditional(image, max_length=args.max_length)
-            elapsed = time.time() - start_time
-            print(f"Caption: {unconditional_caption}")
-            print(f"Time: {elapsed:.3f} seconds")
-        
-        return  # Exit early, don't process directory
+    # Resolve input path
+    input_path = Path(args.input_path).expanduser().resolve()
     
-    # Default mode: Process all images in directory
-    try:
-        results = process_images_from_directory(
-            images_dir=args.images_dir,
-            model_name=args.model,
-            use_conditional=args.conditional,
-            prompt=args.prompt,
-            batch_size=args.batch_size,
-            max_length=args.max_length,
-            num_workers=args.num_workers
-        )
-            
-        # Save results to JSON if requested
-        if args.output:
-            import json
-            output_path = Path(args.output)
-            with open(output_path, 'w') as f:
-                json.dump(results, f, indent=2)
-            print(f"\n✅ Results saved to: {output_path}")
+    if not input_path.exists():
+        print(f"❌ Error: Path does not exist: {args.input_path}")
+        exit(1)
+    
+    # Initialize model
+    minicpm_model = MiniCPMVImageCaptioning(model_name=args.model)
+    
+    # Check if input is a file or directory
+    if input_path.is_file():
+        # Single image file processing
+        print("=" * 60)
+        print("SINGLE IMAGE PROCESSING")
+        print("=" * 60)
+        print(f"Processing image: {input_path.name}")
+        print()
         
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
+        try:
+            image = minicpm_model.load_image_from_path(str(input_path))
+            
+            if args.conditional:
+                start_time = time.time()
+                caption = minicpm_model.generate_caption_conditional(image, prompt_text=args.prompt, max_length=args.max_length)
+                elapsed = time.time() - start_time
+                print(f"Conditional Caption (prompt: '{args.prompt}'): {caption}")
+                print(f"Processing time: {elapsed:.3f} seconds")
+            else:
+                start_time = time.time()
+                caption = minicpm_model.generate_caption_unconditional(image, max_length=args.max_length)
+                elapsed = time.time() - start_time
+                print(f"Caption: {caption}")
+                print(f"Processing time: {elapsed:.3f} seconds")
+            
+            # Save to JSON if requested
+            if args.output:
+                import json
+                output_path = Path(args.output)
+                result = {
+                    'image_path': str(input_path),
+                    'image_name': input_path.name,
+                    'caption': caption,
+                    'processing_time': elapsed
+                }
+                with open(output_path, 'w') as f:
+                    json.dump([result], f, indent=2)
+                print(f"\n✅ Result saved to: {output_path}")
+        
+        except Exception as e:
+            print(f"\n❌ Error processing image: {e}")
+            import traceback
+            traceback.print_exc()
+            exit(1)
+    
+    elif input_path.is_dir():
+        # Directory processing
+        try:
+            results = process_images_from_directory(
+                images_dir=str(input_path),
+                model_name=args.model,
+                use_conditional=args.conditional,
+                prompt=args.prompt,
+                batch_size=args.batch_size,
+                max_length=args.max_length,
+                num_workers=args.num_workers
+            )
+                
+            # Save results to JSON if requested
+            if args.output:
+                import json
+                output_path = Path(args.output)
+                with open(output_path, 'w') as f:
+                    json.dump(results, f, indent=2)
+                print(f"\n✅ Results saved to: {output_path}")
+        
+        except Exception as e:
+            print(f"\n❌ Error: {e}")
+            import traceback
+            traceback.print_exc()
+            exit(1)
+    
+    else:
+        print(f"❌ Error: Path is neither a file nor a directory: {args.input_path}")
         exit(1)
 
 

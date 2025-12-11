@@ -1,9 +1,10 @@
 """
-Model loading for BLIP
+Model loading for BLIP - Optimized for speed
 """
 import os
 import torch
 from typing import Tuple, Optional
+from PIL import Image
 
 try:
     from transformers import BlipProcessor, BlipForConditionalGeneration
@@ -12,11 +13,18 @@ except ImportError:
     BlipForConditionalGeneration = None
     print("Warning: Transformers not available. Install with: pip install transformers")
 
+# Import cudnn for GPU optimizations
+try:
+    import torch.backends.cudnn as cudnn
+except ImportError:
+    cudnn = None
+
 
 def load_captioning_model() -> Tuple[Optional[any], Optional[any]]:
     """
     Loads the BLIP image captioning model and processor.
-    Optimized for CPU inference speed.
+    Optimized for both CPU and GPU inference speed.
+    Includes FP16 for GPU, warmup, and other optimizations.
     
     Returns:
         Tuple of (processor, model) or (None, None) if not available
@@ -34,6 +42,12 @@ def load_captioning_model() -> Tuple[Optional[any], Optional[any]]:
             torch.set_num_threads(num_threads)
             torch.set_num_interop_threads(num_threads)
             print(f"CPU optimization: Using {num_threads} threads")
+        else:
+            # GPU optimizations
+            if cudnn is not None:
+                cudnn.benchmark = True  # Optimize for consistent input sizes
+                cudnn.deterministic = False  # Allow non-deterministic algorithms for speed
+            print("GPU optimizations enabled")
         
         # Load processor with fast inference enabled
         try:
@@ -53,18 +67,43 @@ def load_captioning_model() -> Tuple[Optional[any], Optional[any]]:
         model.eval()
         
         # Move to device
-        if torch.cuda.is_available():
-            model.to("cuda:0")
-            print("BLIP model loaded on CUDA")
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        model.to(device)
+        
+        # Enable FP16 on GPU for 2x faster inference
+        if device.startswith("cuda"):
+            model.half()
+            print("BLIP model loaded on CUDA with FP16 (2x faster)")
         else:
-            model.to("cpu")
             print("BLIP model loaded on CPU")
+        
+        # Warmup model (important for transformer models)
+        try:
+            print("Warming up model...")
+            dummy_image = Image.new("RGB", (384, 384), color="white")
+            dummy_inputs = processor(images=dummy_image, return_tensors="pt").to(device)
+            if device.startswith("cuda"):
+                dummy_inputs = {k: v.half() if v.dtype == torch.float32 else v for k, v in dummy_inputs.items()}
+            
+            with torch.inference_mode():
+                if device.startswith("cuda"):
+                    with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+                        _ = model.generate(**dummy_inputs, max_length=5, num_beams=1)
+                else:
+                    _ = model.generate(**dummy_inputs, max_length=5, num_beams=1)
+            print("Model warmup completed")
+        except Exception as warmup_error:
+            print(f"Model warmup skipped: {warmup_error}")
         
         # Try to compile model for faster inference (PyTorch 2.0+)
         try:
-            if hasattr(torch, 'compile') and not torch.cuda.is_available():
-                print("Compiling model for faster CPU inference...")
-                model = torch.compile(model, mode='reduce-overhead')
+            if hasattr(torch, 'compile'):
+                if torch.cuda.is_available():
+                    print("Compiling model for faster GPU inference...")
+                    model = torch.compile(model, mode='max-autotune')
+                else:
+                    print("Compiling model for faster CPU inference...")
+                    model = torch.compile(model, mode='reduce-overhead')
                 print("Model compiled successfully")
         except Exception as compile_error:
             print(f"Model compilation skipped: {compile_error}")

@@ -91,14 +91,16 @@ def process_video_frames(video_path: str) -> List[Dict[str, Any]]:
     print("Generating descriptions with BLIP...")
     pil_images = [frame_data['frame_image'] for frame_data in frames_data]
     
-    # Auto-adjust batch size based on device for optimal performance
-    batch_size = 4 if device == "cpu" else 8
+    # Use optimized batch_size=16 and num_workers=6 (from blip_faster.py)
+    batch_size = 16
+    num_workers = 6
     descriptions = generate_scene_descriptions(
         pil_images, 
         caption_processor, 
         caption_model, 
         device,
-        batch_size=batch_size
+        batch_size=batch_size,
+        num_workers=num_workers
     )
     
     # Step 6: Build result list
