@@ -7,6 +7,13 @@ import uuid
 import cv2
 from typing import List, Dict, Any
 
+# CPU optimization: Set environment variables before importing torch
+if not os.environ.get('CUDA_VISIBLE_DEVICES'):
+    # Optimize CPU performance
+    os.environ['OMP_NUM_THREADS'] = str(os.cpu_count() or 4)
+    os.environ['MKL_NUM_THREADS'] = str(os.cpu_count() or 4)
+    os.environ['NUMEXPR_NUM_THREADS'] = str(os.cpu_count() or 4)
+
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
@@ -83,7 +90,16 @@ def process_video_frames(video_path: str) -> List[Dict[str, Any]]:
     # Step 5: Generate descriptions for all frames (batch processing)
     print("Generating descriptions with BLIP...")
     pil_images = [frame_data['frame_image'] for frame_data in frames_data]
-    descriptions = generate_scene_descriptions(pil_images, caption_processor, caption_model, device)
+    
+    # Auto-adjust batch size based on device for optimal performance
+    batch_size = 4 if device == "cpu" else 8
+    descriptions = generate_scene_descriptions(
+        pil_images, 
+        caption_processor, 
+        caption_model, 
+        device,
+        batch_size=batch_size
+    )
     
     # Step 6: Build result list
     results = []
@@ -117,3 +133,4 @@ if __name__ == "__main__":
     print("RESULTS:")
     print("="*80)
     print(json.dumps(results, indent=2))
+

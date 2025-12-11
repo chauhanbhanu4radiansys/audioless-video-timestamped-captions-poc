@@ -27,3 +27,4 @@ def notify(tenant, id, success, sns_topic_arn, data={}):
 
     except Exception as e:
         print(f"Error sending SNS notification: {str(e)}")
+

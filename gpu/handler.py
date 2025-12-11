@@ -169,3 +169,4 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 # For RunPod serverless
 if runpod is not None:
     runpod.serverless.start({"handler": handler})
+

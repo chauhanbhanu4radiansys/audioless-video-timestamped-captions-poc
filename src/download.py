@@ -110,3 +110,4 @@ def download_from_url(url: str, output_path: Optional[str] = None, chunk_size: i
     finally:
         if session:
             session.close()
+

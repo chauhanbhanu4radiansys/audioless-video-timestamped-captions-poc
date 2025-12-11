@@ -45,9 +45,16 @@ snapshot_download('Salesforce/blip-image-captioning-large',
                   cache_dir='/model_cache/huggingface',
                   local_files_only=False)
 
-print('Loading BLIP processor...')
-processor = BlipProcessor.from_pretrained('Salesforce/blip-image-captioning-large',
-                                          cache_dir='/model_cache/huggingface')
+print('Loading BLIP processor with fast inference...')
+try:
+    processor = BlipProcessor.from_pretrained('Salesforce/blip-image-captioning-large',
+                                              cache_dir='/model_cache/huggingface',
+                                              use_fast=True)
+    print('✓ Fast processor loaded')
+except Exception as e:
+    print(f'Fast processor not available, using slow processor: {e}')
+    processor = BlipProcessor.from_pretrained('Salesforce/blip-image-captioning-large',
+                                              cache_dir='/model_cache/huggingface')
 
 print('Loading BLIP model...')
 model = BlipForConditionalGeneration.from_pretrained('Salesforce/blip-image-captioning-large',
@@ -66,4 +73,10 @@ COPY ./main.py /main.py
 ENV PYTHONPATH=/
 ENV CUDA_VISIBLE_DEVICES=0
 
+# CPU optimization environment variables (will be overridden if CUDA is available)
+ENV OMP_NUM_THREADS=4
+ENV MKL_NUM_THREADS=4
+ENV NUMEXPR_NUM_THREADS=4
+
 CMD ["python3.11", "-u", "/handler.py"]
+

@@ -144,3 +144,4 @@ def extract_frames_from_scenes(video_path: str, scene_list: List, fps: float) ->
     
     cap.release()
     return frames_data
+

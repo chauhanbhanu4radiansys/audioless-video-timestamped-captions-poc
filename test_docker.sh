@@ -129,3 +129,4 @@ echo "  - Test handler: local.py (used for local testing)"
 echo ""
 echo "To test manually:"
 echo "  docker run --rm ${GPU_FLAG} ${IMAGE_NAME} python3.11 -u /local.py <video_url>"
+

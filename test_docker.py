@@ -116,12 +116,37 @@ def run_local_test(image_name, video_path, gpu_flag):
             'python3.11', '-u', '/local.py'
         ])
     else:
-        if not os.path.exists(video_path):
-            print_error(f"Video file not found: {video_path}")
+        # Resolve path and check if file exists
+        video_path_resolved = str(Path(video_path).expanduser().resolve())
+        
+        if not os.path.exists(video_path_resolved):
+            print_error(f"Video file not found: {video_path_resolved}")
+            
+            # Try to suggest similar files
+            video_dir = Path(video_path_resolved).parent
+            video_name_pattern = Path(video_path_resolved).name.lower()
+            
+            if video_dir.exists():
+                print_warning("Searching for similar files in the same directory...")
+                try:
+                    similar_files = []
+                    for ext in ['.mp4', '.mov', '.avi', '.mkv']:
+                        for file in video_dir.glob(f'*{ext}'):
+                            if video_name_pattern.replace('output-', '').replace('-', '') in file.name.lower().replace('-', ''):
+                                similar_files.append(str(file))
+                    
+                    if similar_files:
+                        print_warning(f"Found similar files:")
+                        for f in similar_files[:5]:  # Show max 5 suggestions
+                            print(f"  - {f}")
+                        print_warning(f"Try using one of these files instead.")
+                except Exception:
+                    pass
+            
             return False
         
-        video_dir = str(Path(video_path).parent.resolve())
-        video_file = Path(video_path).name
+        video_dir = str(Path(video_path_resolved).parent.resolve())
+        video_file = Path(video_path_resolved).name
         
         cmd.extend([
             '-v', f'{video_dir}:/videos',
@@ -239,3 +264,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
