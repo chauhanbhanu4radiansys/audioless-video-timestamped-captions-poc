@@ -6,6 +6,7 @@ This script runs the pipeline on your local machine.
 import os
 import sys
 import json
+import time
 from pathlib import Path
 
 # Set runtime environment
@@ -102,8 +103,10 @@ def main():
     print()
     
     try:
+        overall_start = time.time()
         # Process video
         results = process_video_frames(video_path)
+        total_time = time.time() - overall_start
         
         print()
         print("=" * 60)
@@ -113,13 +116,7 @@ def main():
         print(f"Total frames processed: {len(results)}")
         print()
         
-        # Display results
-        print("=" * 60)
-        print("RESULTS:")
-        print("=" * 60)
-        print(json.dumps(results, indent=2))
-        
-        # Optionally save to file
+        # Save to file
         output_file = os.path.join(PROJECT_ROOT, "results.json")
         try:
             with open(output_file, 'w') as f:
@@ -128,7 +125,9 @@ def main():
             print(f"✅ Results saved to: {output_file}")
         except Exception as save_error:
             print(f"⚠️  Could not save results to file: {save_error}")
-        
+
+        print(f"⏱️  Total processing time: {total_time:.2f} seconds")
+        print(f"📁 Results file: {output_file}")
         print()
         print("=" * 60)
         print("✅ Test completed successfully!")
