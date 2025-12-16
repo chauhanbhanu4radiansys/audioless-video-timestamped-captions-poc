@@ -24,7 +24,7 @@ wheels/
 *.egg
 
 # Output files
-*.json
+# *.json
 !package.json
 *.mp4
 *.avi
